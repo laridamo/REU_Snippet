@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Apr 27 16:22:32 2023
+
+@author: laridamo
+"""
+
+import os, sys
+from pathlib import Path
+import pandas
+import sklearn
+import numpy as np
+import xgboost as xg
+from rdkit import Chem
+from rdkit.Chem import Descriptors
+from rdkit.ML.Descriptors import MoleculeDescriptors
+from sklearn import preprocessing
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from sklearn import metrics
+
+
+root_dir = Path('/Users/laridamo/Documents/CSU/chlorinated_paraffins')
+db_dir = root_dir / 'db'
+data_dir = root_dir / 'data'
+sample_dir = data_dir / 'sampled'
+fig_dir = root_dir / 'figures'
+
+
+
+
+def result_bin(b=3):
+    """
+    Normalizes output (change in liver weight) and sorts into equally sized classes by value
+
+    Parameters
+    ----------
+    b : desired number of classes
+
+    Returns
+    -------
+    norm_lwpbw : classified outputs
+
+    """
+    # Import data
+    os.chdir(data_dir)
+    df_endpoint = pandas.read_excel('liver_wt_per_body_wt.xlsx')
+    lwpbw = df_endpoint.norm
+    norm_lwpbw = []
+    
+    # Normalization from 0-1
+    for it in range(len(lwpbw)):
+        norm_l = (lwpbw[it] - min(lwpbw))/(max(lwpbw) - min(lwpbw))
+        norm_lwpbw += [norm_l]
+    
+    # Finding thresholds for classification
+    sorted_lwpbw = norm_lwpbw.copy()
+    sorted_lwpbw.sort()
+    sub_length = int(len(sorted_lwpbw) / b)
+    index = 0
+    lims = []
+    for it in range(b-1):
+        index += sub_length
+        lims += [sorted_lwpbw[index].round(2)]
+    lims += [1]
+    print(lims)
+    
+    # Classification
+    lower = 0
+    for it in range(b):
+        upper = lims[it]
+        for n in range(len(norm_lwpbw)):
+            if lower < norm_lwpbw[n] < upper:
+                norm_lwpbw[n] = it
+        lower = upper
+    
+    return norm_lwpbw
+
+
+
+
+def calc_descriptors(g=2):
+    '''
+    Generates and saves molecular descriptor dataset for testing/training the QSAR model
+
+    Parameters
+    ----------
+    g : desired number of classes
+
+    '''
+    # Import data
+    os.chdir(data_dir)
+    df_endpoint = pandas.read_excel('liver_wt_per_body_wt.xlsx')
+    mixtures = df_endpoint.mixture
+    increased_lw = result_bin(b=g)
+    conc = df_endpoint.concentration
+    norm_conc = []
+    
+    # Normalize concentration from 0-1
+    for it in range(len(increased_lw)):
+        norm_c = (conc[it] - min(conc))/(max(conc) - min(conc))
+        norm_conc += [norm_c]
+    
+    os.chdir(sample_dir)
+    df_lwpbw_data = pandas.DataFrame()
+    
+    # Iterate through mixtures and calculate descriptors for each
+    for it in range(len(mixtures)):
+        
+        # Import SMILES for the 1000 molecules in the mixture, match with the mixture's concentration
+        mix_conc = [norm_conc[it]] * 1000
+        smiles = pandas.read_pickle('{}.pkl'.format(mixtures[it]))
+        mols = [Chem.MolFromSmiles(s) for s in smiles]
+        
+        # Calculate ~2000 descriptors for each molecule and scale from 0-1
+        nms=[x[0] for x in Descriptors._descList]
+        calc = MoleculeDescriptors.MolecularDescriptorCalculator(nms)
+        min_max_scaler = preprocessing.MinMaxScaler()
+        
+        descrs = [calc.CalcDescriptors(x) for x in mols]
+        descrs = [np.where(n != float('inf'), n, np.nan) for n in descrs]
+        scaled_descrs = min_max_scaler.fit_transform(descrs)
+        df_desc = pandas.DataFrame(scaled_descrs, columns=nms)
+        df_desc.insert(0, 'conc', mix_conc)
+        
+        # Pair with mixture's result value
+        result = [increased_lw[it]] * 1000
+        df_desc.insert(0, 'result', result)
+        df_lwpbw_data = pandas.concat([df_lwpbw_data, df_desc], ignore_index=True)
+        
+        # Monitor progress
+        print(it)
+        
+        # Remove trivial descriptors from dataset
+        trivial = []
+        for d in nms:
+            if all([num == 0 for num in df_desc[d]]) == True:
+                trivial += [d]
+        df_desc = df_desc.drop(trivial, axis=1)
+
+    # Save data
+    outfile = data_dir / 'lwpbw_data.pkl'
+    df_lwpbw_data.to_pickle(outfile)
+    
+    
+def test_train():
+    """
+    Randomly splits data 80/20 train/test, separates input/output
+
+    Returns
+    -------
+    train_x : training input
+    train_y : training output
+    test_x : testing input
+    test_y : expected testing output
+
+    """
+    
+    os.chdir(data_dir)
+    df_all = pandas.read_pickle('lwpbw_data.pkl')
+    
+    df_test = df_all.sample(frac=0.2)
+    df_train = df_all.drop(df_test.index)
+    
+    test_y = np.array(df_test.result)
+    df_test.drop('result', axis=1)
+    test_x = np.array(df_test)
+    
+    train_y = np.array(df_train.result)
+    df_train.drop('result', axis=1)
+    train_x = np.array(df_train)
+    
+    return train_x, train_y, test_x, test_y
+    
+
+def xgrfc(t=100, d=0.02):
+    """
+    Creates and evaluates random forest classifier for given test/train sets
+
+    Parameters
+    ----------
+    t : number of trees
+    d : number of features used at each node
+
+
+    """
+    
+    os.chdir(data_dir)
+    train_x, train_y, test_x, test_y = test_train()
+    
+    
+    model = xg.XGBRFClassifier(n_estimators=t, colsample_bynode=d)
+    model.fit(train_x, train_y)
+    y_pred = model.predict(test_x)
+    #print("Test  Accuracy Score : %.2f"%model.score(test_x, test_y))
+    #print("Train Accuracy Score : %.2f"%model.score(train_x, train_y))
+    cm = sklearn.metrics.confusion_matrix(test_y, y_pred)
+    #tn, tp, fn, fp = cm[0][0], cm[1][1], cm[1][0], cm[0][1]
+    #precision = tp / (tp + fp)
+    #recall = tp / (tp + fn)
+    #f1 = (2 * precision * recall) / (precision + recall)
+    
+    return cm#, precision, recall, f1
